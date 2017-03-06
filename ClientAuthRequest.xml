@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+    <s:Header>
+        <h:ClientAuth xmlns:h="http://soap-authentication.org/digest/2001/10/" s:mustUnderstand="1">
+            <Nonce />
+            <Auth />
+            <UserID />
+            <Realm />
+        </h:ClientAuth>
+    </s:Header>
+    <s:Body />
+</s:Envelope>
