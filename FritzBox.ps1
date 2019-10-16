@@ -3,33 +3,35 @@ New-Variable -Name InitialRequest -Value ([xml](Get-Content "$PSScriptRoot\initi
 
 $MD5Provider = [System.Security.Cryptography.MD5]::Create()
 
+$script:NameSpaceManager = New-Object System.Xml.XmlNamespaceManager (New-Object System.Xml.NameTable)
+$script:NameSpaceManager.AddNamespace("h","http://soap-authentication.org/digest/2001/10/")
+$script:NameSpaceManager.AddNamespace("s","http://schemas.xmlsoap.org/soap/envelope/")
+
 function New-FBSession {
 param (
     [string]$Fritzbox = "fritz.box",
     [string]$Username = "admin",
     [Parameter(Mandatory=$true)][string]$Password,
-    [int]$port = 49000
+    [int]$port = 49000,
+    [Switch]$TrySecureSession
 )
 
 [xml]$serviceinfo = Invoke-WebRequest -Method GET -Uri "http://$($FritzBox):$port/tr64desc.xml"
 
-[System.Xml.XmlNamespaceManager]$ns = new-Object System.Xml.XmlNamespaceManager $serviceinfo.NameTable
-$ns.AddNamespace("ns",$serviceinfo.DocumentElement.NamespaceURI)
-$ns.AddNamespace("h","http://soap-authentication.org/digest/2001/10/")
-$ns.AddNamespace("s","http://schemas.xmlsoap.org/soap/envelope/")
+$script:NameSpaceManager.AddNamespace("ns",$serviceinfo.DocumentElement.NamespaceURI)
 
 $Session = New-Object PSObject -Property (
     [ordered]@{ServiceInfo=$serviceinfo;
-    NameSpaceManager=$ns;
     Credentials=New-Object System.Net.NetworkCredential $Username, $Password
     Host="http://$($Fritzbox):$port"})
 
 $Session.psobject.TypeNames.Insert(0,'Serpen.FritzBox.Session')
 
-$portXML = Get-FBSecurityPort $Session
+if ($TrySecureSession) {
+    $port = Get-FBSecurityPort $Session
 
-if ([int]::TryParse($portXML.innerText, [ref]$port)) {
     $Session.Host = "https://$($Fritzbox):$port"
+
 }
 
 $Session
@@ -53,14 +55,14 @@ param(
     [hashtable]$Parameters = @{}
 )
 
-    $WebRequest = [System.Net.WebRequest]::Create("$($Session.Host)$URL")
+    $WebRequest = [System.Net.WebRequest]::CreateHttp("$($Session.Host)$URL")
     $WebRequest.Headers.Add('SOAPAction',"$($serviceType)#$($action)")
     $WebRequest.ContentType = 'text/xml; charset="UTF-8"'
     $WebRequest.Accept      = 'text/xml'
     $WebRequest.Method      = 'POST'
 
     #only for https
-    $WebRequest.ServerCertificateValidationCallback = {$true}
+    $WebRequest.ServerCertificateValidationCallback = {param($sender, $cert, $chain, $err) Write-Verbose $cert;  $true}
 
     #used in older fritzbox versions only
     $WebRequest.Credentials = $Session.Credentials
@@ -75,9 +77,9 @@ param(
         $newParam.InnerText = $param.value
         $actionNode.AppendChild($newParam) | Out-Null
     }
-    $RequestXML.SelectSingleNode("s:Envelope/s:Body", $Session.NameSpaceManager).AppendChild($actionNode) | Out-Null
+    $RequestXML.SelectSingleNode("s:Envelope/s:Body", $script:NameSpaceManager).AppendChild($actionNode) | Out-Null
     
-    $RequestXML.Save("$env:temp\fbreq-last.xml")
+    $RequestXML.Save("$PSScriptRoot\fbreq-last.xml")
         
     $requestStream = $WebRequest.GetRequestStream()
     $RequestXML.Save($requestStream)
@@ -88,9 +90,20 @@ param(
         $responseXML = $responseStream.ReadToEnd()
         $responseStream.Close()
     } catch {
-        [xml]$serviceNodeDefinition = Invoke-WebRequest -Uri "$($Session.host)$($serviceNode.SCPDURL)"
+        $WebRequest = [System.Net.WebRequest]::CreateHttp("$($Session.host)$($serviceNode.SCPDURL)")
+        #only for https
+        $WebRequest.ServerCertificateValidationCallback = {param($sender, $cert, $chain, $err) Write-Verbose $cert;  $true}
 
-        if ($responseXML -eq $null -or ($responseXML.SelectSingleNode("s:Envelope/s:Body/s:Fault", $Session.NameSpaceManager))) {
+        #used in older fritzbox versions only
+        $WebRequest.Credentials = $Session.Credentials
+
+        [System.IO.StreamReader]$responseStream = $WebRequest.GetResponse().GetResponseStream()
+        [xml]$serviceNodeDefinition = $responseStream.ReadToEnd()
+        $responseStream.Close()
+
+        #[xml]$serviceNodeDefinition = Invoke-WebRequest -Uri "$($Session.host)$($serviceNode.SCPDURL)"
+
+        if ($responseXML -eq $null -or ($responseXML.SelectSingleNode("s:Envelope/s:Body/s:Fault", $script:NameSpaceManager))) {
             $actionNode = $serviceNodeDefinition.scpd.actionList.SelectSingleNode("*[*='$Action']")
             if ($actionNode -eq $null) {
                 Write-Error "Action $Action is not defined!"
@@ -114,7 +127,7 @@ param(
     } #end catch
 
 
-    $responseXML.Save("$env:temp\fbres-last.xml")
+    $responseXML.Save("$PSScriptRoot\fbres-last.xml")
     $responseXML
 }
 
@@ -127,8 +140,8 @@ param (
     $return = $AuthRequest.Clone()
 
     # read challange data from last response
-    $Nonce = $response.SelectSingleNode("s:Envelope/s:Header/h:*/Nonce", $Session.NameSpaceManager)
-    $Realm = $response.SelectSingleNode("s:Envelope/s:Header/h:*/Realm", $Session.NameSpaceManager)
+    $Nonce = $response.SelectSingleNode("s:Envelope/s:Header/h:*/Nonce", $script:NameSpaceManager)
+    $Realm = $response.SelectSingleNode("s:Envelope/s:Header/h:*/Realm", $script:NameSpaceManager)
 
     if ($Nonce -eq $null -or $Realm -eq $null) {
         Write-Error "No challenge information" -TargetObject $response -Category AuthenticationError
@@ -146,11 +159,16 @@ param (
 function Get-FBActions {
 param ([Parameter(Mandatory=$true)]$Session)
     #enumerate all service nodes
-    foreach ($service in ($Session.ServiceInfo.SelectNodes("//ns:service", $Session.NameSpaceManager))) {
-        
-        #load parameter defintion file
-        [xml]$xml = Invoke-WebRequest -Uri "$($Session.host)$($service.SCPDURL)"
-        
+    foreach ($service in ($Session.ServiceInfo.SelectNodes("//ns:service", $script:NameSpaceManager))) {
+
+        $WebRequest = [System.Net.WebRequest]::CreateHttp("$($Session.host)$($service.SCPDURL)")
+        $WebRequest.ServerCertificateValidationCallback = {$true}
+
+        [System.IO.StreamReader]$responseStream = $WebRequest.GetResponse().GetResponseStream()
+        [xml]$xml = $responseStream.ReadToEnd()
+        $responseStream.Close()
+
+
         #enumerate all actions
         foreach ($action in ($xml.scpd.actionList.SelectNodes("*"))) {
             $allINPparams = @()
@@ -159,12 +177,14 @@ param ([Parameter(Mandatory=$true)]$Session)
             #enumerate all parameters i/o
             foreach ($param in ($action.selectNodes("*/*"))) {
                 if ($param.direction -eq 'in') {
-                    $allINPparams+=($param.name)
+                    $allINPparams+= $param.name
                 } else {
-                    $allOUTparams+=($param.name)
+                    $allOUTparams+= $param.name
                 }
             }
-            New-Object PSObject -Property ([ordered]@{Service=$service.serviceType;Action=$action.name; ParameterOut=$allOUTparams; ParameterIn=$allINPparams}) 
+            $fbaction = New-Object PSObject -Property ([ordered]@{Service=$service.serviceType;Action=$action.name; ParameterOut=$allOUTparams; ParameterIn=$allINPparams}) 
+            $fbaction.psobject.TypeNames.Insert(0,'Serpen.Fritzbox.FbAction')
+            $fbaction
         }
     }
 }
@@ -178,7 +198,7 @@ param (
 )
     # search for matching service entry
     #$serviceNode = $Session.serviceinfo.SelectNodes("//*[*='$service']")
-    $serviceNode = $Session.serviceinfo.SelectNodes(([string]"//ns:service[ns:serviceType='$service']"), ([System.Xml.XmlNamespaceManager]$Session.NameSpaceManager))
+    $serviceNode = $Session.serviceinfo.SelectNodes("//ns:service[ns:serviceType='$service']", $script:NameSpaceManager)
 
     if ($serviceNode.count -eq 0) {
         Write-Error "no Service '$service' found"
@@ -208,7 +228,7 @@ param (
             return
         }
     }
-    return $responseXML.SelectSingleNode("s:Envelope/s:Body/*", $Session.NameSpaceManager)
+    return $responseXML.SelectSingleNode("s:Envelope/s:Body/*", $script:NameSpaceManager)
 }
 
 function Invoke-FBEnumeration {
@@ -229,9 +249,24 @@ param (
     }
 }
 
+<#
+Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:DeviceInfo:1' -Action 'GetInfo'
+Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:DeviceInfo:1' -Action 'GetDeviceLog'
+Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:DeviceInfo:1' -Action 'GetSecurityPort'
+#Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:DeviceConfig:1' -Action 'Reboot'
+Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:WLANConfiguration:1' -Action 'GetInfo'
+Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:WLANConfiguration:2' -Action 'GetSSID'
+Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:Hosts:1' -Action 'GetHostNumberOfEntries'
+Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:Hosts:1' -Action 'GetGenericHostEntry'
+Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:Hosts:1' -Action 'GetSpecificHostEntry'
+
+Get-FBActions $SessionErsatz | ogv -PassThru | % {Invoke-FBAction -Session $SessionErsatz -Service $_.service -Action $_.action}
+#>
+
 function Get-FBSecurityPort {
+[OutputType([int])]
 param ([Parameter(Mandatory=$true)]$Session)
-    Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:DeviceInfo:1' -Action 'GetSecurityPort'
+    Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:DeviceInfo:1' -Action 'GetSecurityPort' | select -ExpandProperty NewSecurityPort
 }
 
 function Get-FBInfo{
@@ -240,6 +275,14 @@ param ([Parameter(Mandatory=$true)]$Session)
     $action = 'GetInfo'
 
     Invoke-FBAction -session $Session -Service $Service -action $action
+}
+
+function Get-FBDeviceLog {
+param ([Parameter(Mandatory=$true)]$Session)
+    $Service = 'urn:dslforum-org:service:DeviceInfo:1'
+    $action = 'GetDeviceLog'
+
+    Invoke-FBAction -session $Session -Service $Service -action $action | select -ExpandProperty NewDeviceLog
 }
 
 function Get-FBCallList {
@@ -252,3 +295,20 @@ param ([Parameter(Mandatory=$true)]$Session)
     $CallList.root.Call
 }
 
+<#
+
+$Session = New-FBSession
+$SessionErsatz = New-FBSession -Fritzbox 192.168.178.28
+
+
+Get-FBSecurityPort -session $Session
+Get-FBSecurityPort -session $SessionErsatz
+
+Invoke-FBAction -Session $Session -Service 'urn:dslforum-org:service:Hosts:1' -Action 'GetHostNumberOfEntries'
+Invoke-FBAction -Session $SessionErsatz -Service 'urn:dslforum-org:service:Hosts:1' -Action 'GetHostNumberOfEntries'
+
+$Session = New-FBSession -Fritzbox 192.168.178.1
+#$Session.ServiceInfo.Save("$PSScriptRoot\fritzbox-service.xml")
+#Get-FBInfo -Session $Session | tee -FilePath "$PSScriptRoot\fritzbox-service.xml"
+Get-FBSecurityPort $Session
+#>
